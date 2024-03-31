@@ -5,36 +5,49 @@ from langchain_community.llms.ollama import Ollama
 from langchain.prompts import PromptTemplate
 from langchain import hub
 from langchain.schema.runnable import RunnablePassthrough
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.embeddings.sentence_transformer import ( SentenceTransformerEmbeddings )
 from langchain_community.vectorstores.chroma import Chroma
+from langchain_core.output_parsers import StrOutputParser
+import chromadb
 
-prompt_template = """
-### [INST] 
-Instruction: Answer the question based on your 
-art of war knowledge. Here is context to help:
+MODEL_NAME = 'llama2'
+DB_PERSIST_DIRECTORY = './chroma'
+collection_name = 'arte_de_la_guerra'
+file_name = './art_of_war.txt'
+query = 'Cuales son las principales estratégias militares?'
 
-{context}
+def instantiate_llm(model_name):
+  return Ollama(model=model_name)
 
-### QUESTION:
-{question} 
+def create_chain(llm):
+  return load_qa_chain(llm=llm, chain_type='stuff', verbose=True)
 
-[/INST]
- """
+def create_prompt_template():
+  return """Answer the question in html format and based only on the following context:
+        {context}
 
-prompt = PromptTemplate(
-    input_variables=["context", "question"],
-    template=prompt_template,
-)
+        Question: {question}
+        """
 
-rag_prompt = hub.pull('rlm/rag-prompt')
+def create_prompt(prompt_template):
+  return ChatPromptTemplate.from_template(prompt_template)
 
-llm = Ollama(model='llama2')
+def create_collection(persistent_client_db, collection_name):
+  return persistent_client_db.get_or_create_collection(collection_name)
 
-llm_chain = load_qa_chain(llm=llm, chain_type='stuff', verbose=True)
+def get_chroma_client():
+  return chromadb.PersistentClient()
 
 def get_documents(file):
   loader = TextLoader(file, encoding='utf-8')
   return loader.load()
+
+def create_ids(docs):
+  ids = []
+  for i in range(0, len(docs)):
+    ids.append(str(i))
+  return ids
 
 def create_chunks(documents):
   text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
@@ -51,29 +64,46 @@ def get_embedding_function():
   embedding_function = SentenceTransformerEmbeddings(model_name='all-MiniLM-L6-v2')
   return embedding_function
  
-def insert_embeddings(docs, embedding_function):
-  db = Chroma.from_documents(docs, embedding_function, persist_directory='./chromadb')
-  db.persist()
-  return db
+def insert_embeddings(chunks, ids, embedding_function, persistent_client_db, collection):
+  collection.add(ids=ids, documents=chunks)
+  langchain_chroma = Chroma(
+    persist_directory= DB_PERSIST_DIRECTORY,
+    client=persistent_client_db,
+    collection_name=collection_name,
+    embedding_function=embedding_function,
+  )
+  langchain_chroma.persist()
+  return langchain_chroma
 
-def get_data(db, query):
+def get_retriever(db):
   retriever = db.as_retriever()
   return retriever
 
-def send_prompt_llm(results, query):
-  return llm_chain.invoke(input_documents=results, question=query)
+def send_prompt_llm(rag_chain, query):
+  return rag_chain.invoke(query)
+
+def compose_rag_chain(retriever, prompt, llm):
+  return { 'context': retriever, 'question': RunnablePassthrough()} | prompt | llm | StrOutputParser()
+
+def print_response(response):
+  print(response)
 
 def main():
-  documents = get_documents('./art_of_war.txt')
+  llm = instantiate_llm(MODEL_NAME)
+  prompt_template = create_prompt_template()
+  prompt = create_prompt(prompt_template)
+  persistent_client_db = get_chroma_client()
+  documents = get_documents(file_name)
   chunks = create_chunks(documents)
+  text_chunks = extract_page_content(chunks)
+  ids = create_ids(text_chunks)
   embedding_function = get_embedding_function()
-  db = insert_embeddings(chunks, embedding_function)
-  query = 'What are the most important war technics?'
-  retriever = get_data(db, query)
-  rag_chain = { 'context': retriever, 'question': RunnablePassthrough()} | rag_prompt | llm
-  response = rag_chain.invoke(query)
-  # response = send_prompt_llm(results, query)
-  print(response)
+  collection = create_collection(persistent_client_db, collection_name)
+  db = insert_embeddings(text_chunks, ids, embedding_function, persistent_client_db, collection)
+  retriever = get_retriever(db)
+  rag_chain = compose_rag_chain(retriever, prompt, llm)
+  response = send_prompt_llm(rag_chain, query)
+  print_response(response)
 
 if __name__ == "__main__":
     main()
